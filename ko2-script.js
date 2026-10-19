@@ -1,0 +1,986 @@
+(() => {
+"use strict";
+const PAD_LABELS = ["7","8","9","4","5","6","1","2","3",".","0","ENTER"];
+const PAD_PARAMS = ["LEVEL","PITCH","TIME","LPF","HPF","FX","ATK","REL","PAN","TUNE","VEL","MOD"];
+const FADER_ASSIGNS = PAD_PARAMS.slice();
+const FX_NAMES = ["DLY","REV","DST","CHO","FLT","CMP"];
+const PLAY_MODES = ["one","key","leg","lop"];
+const LOOKAHEAD = 0.025, SCHEDULE_AHEAD = 0.1;
+
+const state = {
+  mode: "main", group: 0, selectedPad: 0, shift: false,
+  playing: false, recording: false, recordArmed: false,
+  bpm: 120, swing: 0, quantize: true, metronome: true, metroVol: 0.3, volume: 0.85,
+  fader: 0.8, faderAssign: 0, faderHold: false,
+  fxIndex: 0, fxParams: { x: 0.4, y: 0.3 },
+  noteInterval: 16, patternLength: 16, currentStep: 0, editPage: 0,
+  keysOctave: 0, keysRootPad: 0, keysMode: false, scene: 0, song: [0],
+  countIn: 0, punchFx: new Set(), soloGroups: null,
+  fxHeld: false, eraseHeld: false,
+};
+
+let ctx = null, masterGain, masterComp, fxInput, fxWet, fxDry, fxBusGain;
+let delayNode, delayFeedback, delayFilter, convolver, reverbGain;
+let distortion, distortionGain, chorusDelay, chorusLfo, chorusGain, fxFilter, compressor;
+const groupGains = [], groupFxSends = [], groupFilters = [];
+const pads = [[], [], [], []];
+const patterns = [[], [], [], []];
+const scenes = [{ name: "1" }];
+let schedulerTimer = null, nextNoteTime = 0, stepInBar = 0;
+const activeVoices = new Map();
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._id); toast._id = setTimeout(() => t.classList.remove("show"), 1800);
+}
+function lcd(text, blink) {
+  const el = document.getElementById("lcd");
+  el.textContent = String(text).toUpperCase().slice(0, 3).padStart(3, " ");
+  el.classList.toggle("blink", !!blink);
+}
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function setStatus() {
+  document.getElementById("stMode").textContent = state.mode.toUpperCase().slice(0, 6);
+  document.getElementById("stExtra").textContent = (state.quantize ? "Q" : "F") + " " + state.bpm + (state.keysMode ? " KEY" : "");
+  document.getElementById("ledRec").className = "led" + (state.recording || state.recordArmed ? " rec on" : "");
+  document.getElementById("ledPlay").className = "led" + (state.playing ? " play on" : "");
+  document.getElementById("ledMet").className = "led" + (state.metronome && state.playing ? " on" : "");
+  document.querySelectorAll(".group-btn").forEach((b, i) => b.classList.toggle("active", i === state.group));
+  document.getElementById("btnMain").classList.toggle("lit", state.mode === "main");
+  document.getElementById("btnSound").classList.toggle("lit", state.mode === "sound" || state.mode === "edit");
+  document.getElementById("btnTempo").classList.toggle("lit", state.mode === "tempo");
+  document.getElementById("btnKeys").classList.toggle("active", !!state.keysMode);
+  document.getElementById("btnSample").classList.toggle("active", state.mode === "sample" || state.mode === "chop");
+  document.getElementById("btnFx").classList.toggle("active", state.mode === "fx");
+  document.getElementById("btnTiming").classList.toggle("active", state.mode === "timing");
+  document.getElementById("btnShift").classList.toggle("held", state.shift);
+  document.getElementById("btnRecord").classList.toggle("active", state.recording || state.recordArmed);
+  document.getElementById("btnPlay").classList.toggle("active", state.playing);
+  updatePadLights();
+}
+function updatePadLights() {
+  document.querySelectorAll(".pad").forEach((el, i) => {
+    const snd = pads[state.group][i];
+    el.classList.toggle("has-sound", !!(snd && snd.buffer));
+    const onStep = state.playing && patterns[state.group].some(n => n.step === stepInBar && n.pad === i);
+    const stepView = !state.playing && patterns[state.group].some(n => n.step === state.currentStep && n.pad === i);
+    el.classList.toggle("seq-lit", onStep || stepView);
+  });
+}
+
+function makeImpulse(seconds, decay) {
+  const rate = 44100, len = Math.floor(rate * seconds);
+  const ac = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  const buf = ac.createBuffer(2, len, rate);
+  for (let c = 0; c < 2; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return buf;
+}
+function makeDistortionCurve(amount) {
+  const n = 256, curve = new Float32Array(n), k = amount;
+  for (let i = 0; i < n; i++) { const x = (i * 2) / n - 1; curve[i] = ((Math.PI + k) * x) / (Math.PI + k * Math.abs(x)); }
+  return curve;
+}
+
+function ensureAudio() {
+  if (ctx) return ctx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = new AC();
+  masterGain = ctx.createGain(); masterGain.gain.value = state.volume;
+  masterComp = ctx.createDynamicsCompressor();
+  masterComp.threshold.value = -18; masterComp.knee.value = 12; masterComp.ratio.value = 3;
+  masterComp.attack.value = 0.003; masterComp.release.value = 0.15;
+  fxInput = ctx.createGain(); fxDry = ctx.createGain(); fxDry.gain.value = 1;
+  fxWet = ctx.createGain(); fxWet.gain.value = 0.5; fxBusGain = ctx.createGain();
+  delayNode = ctx.createDelay(2.0); delayNode.delayTime.value = 0.25;
+  delayFeedback = ctx.createGain(); delayFeedback.gain.value = 0.35;
+  delayFilter = ctx.createBiquadFilter(); delayFilter.type = "lowpass"; delayFilter.frequency.value = 4000;
+  delayNode.connect(delayFilter); delayFilter.connect(delayFeedback); delayFeedback.connect(delayNode);
+  convolver = ctx.createConvolver(); convolver.buffer = makeImpulse(1.4, 2.0);
+  reverbGain = ctx.createGain(); reverbGain.gain.value = 0.4;
+  distortion = ctx.createWaveShaper(); distortion.curve = makeDistortionCurve(40); distortion.oversample = "2x";
+  distortionGain = ctx.createGain(); distortionGain.gain.value = 0.3;
+  chorusDelay = ctx.createDelay(0.05); chorusDelay.delayTime.value = 0.012;
+  chorusLfo = ctx.createOscillator();
+  const chorusLfoGain = ctx.createGain(); chorusLfoGain.gain.value = 0.004;
+  chorusLfo.frequency.value = 1.2; chorusLfo.connect(chorusLfoGain); chorusLfoGain.connect(chorusDelay.delayTime); chorusLfo.start();
+  chorusGain = ctx.createGain(); chorusGain.gain.value = 0.35;
+  fxFilter = ctx.createBiquadFilter(); fxFilter.type = "lowpass"; fxFilter.frequency.value = 8000;
+  compressor = ctx.createDynamicsCompressor(); compressor.threshold.value = -24; compressor.ratio.value = 6;
+  fxDry.connect(fxBusGain); fxWet.connect(fxBusGain); fxBusGain.connect(masterComp);
+  masterComp.connect(masterGain); masterGain.connect(ctx.destination);
+  for (let g = 0; g < 4; g++) {
+    const gg = ctx.createGain(); gg.gain.value = 0.9;
+    const send = ctx.createGain(); send.gain.value = 0.15;
+    const filt = ctx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = 18000;
+    gg.connect(filt); filt.connect(fxDry); filt.connect(send); send.connect(fxInput);
+    groupGains.push(gg); groupFxSends.push(send); groupFilters.push(filt);
+  }
+  applyFx();
+  return ctx;
+}
+
+function applyFx() {
+  if (!ctx) return;
+  try { fxInput.disconnect(); } catch (_) {}
+  [delayNode, convolver, distortion, chorusDelay, fxFilter, compressor].forEach(n => { try { n.disconnect(); } catch (_) {} });
+  const x = state.fxParams.x, y = state.fxParams.y;
+  switch (state.fxIndex) {
+    case 0:
+      delayNode.delayTime.value = lerp(0.05, 0.75, x); delayFeedback.gain.value = lerp(0.05, 0.75, y);
+      fxInput.connect(delayNode); delayNode.connect(fxWet); break;
+    case 1:
+      reverbGain.gain.value = lerp(0.1, 0.9, x); fxInput.connect(convolver); convolver.connect(reverbGain); reverbGain.connect(fxWet); break;
+    case 2:
+      distortion.curve = makeDistortionCurve(lerp(10, 120, x)); distortionGain.gain.value = lerp(0.15, 0.7, y);
+      fxInput.connect(distortion); distortion.connect(distortionGain); distortionGain.connect(fxWet); break;
+    case 3:
+      chorusLfo.frequency.value = lerp(0.3, 4, x); chorusGain.gain.value = lerp(0.1, 0.7, y);
+      fxInput.connect(chorusDelay); chorusDelay.connect(chorusGain); chorusGain.connect(fxWet); break;
+    case 4:
+      fxFilter.type = x < 0.5 ? "lowpass" : "highpass";
+      fxFilter.frequency.value = lerp(200, 8000, x < 0.5 ? x * 2 : (x - 0.5) * 2);
+      fxFilter.Q.value = lerp(0.5, 12, y); fxInput.connect(fxFilter); fxFilter.connect(fxWet); break;
+    case 5:
+      compressor.threshold.value = lerp(-40, -10, x); compressor.ratio.value = lerp(2, 12, y);
+      fxInput.connect(compressor); compressor.connect(fxWet); break;
+  }
+}
+
+function renderTone(fn, duration, sampleRate) {
+  sampleRate = sampleRate || 44100;
+  const len = Math.floor(duration * sampleRate);
+  const buf = ctx.createBuffer(1, len, sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = fn(i / sampleRate, i, len);
+  return buf;
+}
+function env(t, a, hold, r, dur) {
+  if (t < a) return t / a;
+  if (t < a + hold) return 1;
+  const relStart = Math.max(a + hold, dur - r);
+  if (t < relStart) return 1;
+  return Math.max(0, 1 - (t - relStart) / r);
+}
+function makeKick() {
+  return renderTone((t) => {
+    const f = 160 * Math.pow(0.05, t / 0.35);
+    return Math.sin(2 * Math.PI * f * t) * env(t, 0.001, 0.05, 0.28, 0.4) * 1.2;
+  }, 0.4);
+}
+function makeSnare() {
+  return renderTone((t) => {
+    const tone = Math.sin(2 * Math.PI * 180 * t) * Math.exp(-t * 18);
+    const noise = (Math.random() * 2 - 1) * Math.exp(-t * 12);
+    return (tone * 0.4 + noise * 0.7) * env(t, 0.001, 0.02, 0.15, 0.25);
+  }, 0.25);
+}
+function makeHat(open) {
+  const dur = open ? 0.35 : 0.08;
+  return renderTone((t) => {
+    let n = 0;
+    for (let h = 1; h <= 6; h++) n += Math.sin(2 * Math.PI * (2000 + h * 1500) * t);
+    n += (Math.random() * 2 - 1);
+    return n * 0.08 * Math.exp(-t * (open ? 8 : 55));
+  }, dur);
+}
+function makeClap() {
+  return renderTone((t) => {
+    const bursts = [0, 0.012, 0.024, 0.045];
+    let v = 0;
+    for (const b of bursts) if (t >= b) v += (Math.random() * 2 - 1) * Math.exp(-(t - b) * 40);
+    return v * 0.5 * env(t, 0.001, 0.02, 0.12, 0.2);
+  }, 0.22);
+}
+function makeTom(f0) {
+  return renderTone((t) => {
+    const f = f0 * Math.pow(0.5, t / 0.25);
+    return Math.sin(2 * Math.PI * f * t) * env(t, 0.002, 0.04, 0.2, 0.3);
+  }, 0.3);
+}
+function makePerc(f) {
+  return renderTone((t) => Math.sin(2 * Math.PI * f * t) * Math.exp(-t * 30) * 0.7, 0.15);
+}
+function makeBass(f) {
+  return renderTone((t) => {
+    const s = Math.sin(2 * Math.PI * f * t) + 0.4 * Math.sin(2 * Math.PI * f * 2 * t);
+    return s * 0.4 * env(t, 0.005, 0.15, 0.2, 0.45);
+  }, 0.45);
+}
+function makeClave() {
+  return renderTone((t) => Math.sin(2 * Math.PI * 2400 * t) * Math.exp(-t * 50) * 0.5, 0.1);
+}
+function makeRim() {
+  return renderTone((t) => (Math.sin(2 * Math.PI * 800 * t) + Math.sin(2 * Math.PI * 1200 * t)) * Math.exp(-t * 40) * 0.35, 0.12);
+}
+function defaultSound(buffer, name) {
+  return { name, buffer, level: 0.9, pitch: 0, tune: 0, start: 0, end: 1, lpf: 18000, hpf: 20,
+    atk: 0.001, rel: 0.05, pan: 0, vel: 1, playMode: 0, timeStretch: 1, fxSend: 0.2 };
+}
+function loadDefaultKit() {
+  ensureAudio();
+  const kitA = [makeKick(), makeSnare(), makeHat(false), makeHat(true), makeClap(), makeTom(120),
+    makeTom(90), makePerc(600), makeRim(), makeClave(), makePerc(900), makeBass(55)];
+  const namesA = ["KIK","SNR","CHH","OHH","CLP","TM1","TM2","PRC","RIM","CLV","PR2","BS1"];
+  pads[0] = kitA.map((b, i) => defaultSound(b, namesA[i]));
+  pads[1] = [41,49,55,62,73,82,87,98,110,123,131,147].map((f, i) => {
+    const s = defaultSound(makeBass(f), "BS" + (i + 1)); s.playMode = 1; s.rel = 0.2; return s;
+  });
+  pads[2] = [262,294,330,349,392,440,494,523,587,659,698,784].map((f, i) => {
+    const b = renderTone((t) => {
+      const wave = Math.sin(2 * Math.PI * f * t) * 0.5 + 0.25 * Math.sin(2 * Math.PI * f * 2 * t);
+      return wave * env(t, 0.01, 0.1, 0.25, 0.4);
+    }, 0.4);
+    const s = defaultSound(b, "ML" + (i + 1)); s.playMode = 1; s.rel = 0.25; return s;
+  });
+  pads[3] = Array.from({ length: 12 }, () => defaultSound(null, "---"));
+}
+
+function stopVoice(key, when) {
+  const list = activeVoices.get(key) || [];
+  const t = when || (ctx ? ctx.currentTime : 0);
+  for (const v of list) {
+    try {
+      v.g.gain.cancelScheduledValues(t);
+      v.g.gain.setValueAtTime(Math.max(v.g.gain.value, 0.0001), t);
+      v.g.gain.linearRampToValueAtTime(0.0001, t + 0.03);
+      v.src.stop(t + 0.05);
+    } catch (_) {}
+  }
+  activeVoices.set(key, []);
+}
+
+function playSound(group, padIndex, when, velocity, pitchOffset, gateDur) {
+  velocity = velocity == null ? 1 : velocity; pitchOffset = pitchOffset || 0;
+  ensureAudio();
+  if (ctx.state === "suspended") ctx.resume();
+  const snd = pads[group][padIndex];
+  if (!snd || !snd.buffer) return;
+  const key = group + ":" + padIndex;
+  if (snd.playMode === 0 || snd.playMode === 2) stopVoice(key, when);
+  const src = ctx.createBufferSource();
+  src.buffer = snd.buffer;
+  let rate = Math.pow(2, (snd.pitch + snd.tune + pitchOffset) / 12) * (snd.timeStretch || 1);
+  src.playbackRate.value = rate;
+  if (snd.playMode === 3) src.loop = true;
+  const g = ctx.createGain();
+  const panner = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+  const lpf = ctx.createBiquadFilter(); lpf.type = "lowpass"; lpf.frequency.value = snd.lpf;
+  const hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = snd.hpf;
+  let level = snd.level * velocity * (snd.vel || 1);
+  if (group === state.group) {
+    const fa = FADER_ASSIGNS[state.faderAssign], fv = state.fader;
+    if (fa === "LEVEL") level *= fv;
+    if (fa === "PITCH" || fa === "TUNE") rate *= Math.pow(2, ((fv - 0.5) * 24) / 12);
+    if (fa === "LPF") lpf.frequency.value = lerp(200, 18000, fv);
+    if (fa === "HPF") hpf.frequency.value = lerp(20, 4000, fv);
+    if (fa === "PAN" && panner) panner.pan.value = (fv - 0.5) * 2;
+    if (fa === "FX") groupFxSends[group].gain.setValueAtTime(fv, when);
+  }
+  src.playbackRate.value = rate;
+  const t0 = Math.max(when, ctx.currentTime);
+  const attack = Math.max(0.001, snd.atk), release = Math.max(0.01, snd.rel);
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(level, t0 + attack);
+  const startOff = snd.start * snd.buffer.duration;
+  const endOff = snd.end * snd.buffer.duration;
+  const dur = Math.max(0.01, (endOff - startOff) / Math.abs(rate));
+  src.connect(hpf); hpf.connect(lpf);
+  if (panner) { panner.pan.value = snd.pan; lpf.connect(panner); panner.connect(g); }
+  else lpf.connect(g);
+  g.connect(groupGains[group]);
+  try {
+    if (src.loop) { src.loopStart = startOff; src.loopEnd = endOff; src.start(t0, startOff); }
+    else src.start(t0, startOff, dur + release);
+  } catch (e) { console.warn(e); return; }
+  let stopAt = null;
+  if (snd.playMode !== 3 && gateDur == null) {
+    stopAt = t0 + dur;
+    g.gain.setValueAtTime(level, Math.max(t0 + attack, stopAt - release));
+    g.gain.linearRampToValueAtTime(0.0001, stopAt);
+    try { src.stop(stopAt + 0.02); } catch (_) {}
+  } else if (gateDur != null) {
+    stopAt = t0 + gateDur;
+    g.gain.setValueAtTime(level, Math.max(t0 + attack, stopAt - release));
+    g.gain.linearRampToValueAtTime(0.0001, stopAt);
+    try { src.stop(stopAt + 0.02); } catch (_) {}
+  }
+  const voice = { src, g, stopAt };
+  if (snd.playMode !== 1) activeVoices.set(key, [voice]);
+  else { if (!activeVoices.has(key)) activeVoices.set(key, []); activeVoices.get(key).push(voice); }
+  const el = document.querySelector('.pad[data-pad="' + padIndex + '"]');
+  if (el && group === state.group) { el.classList.add("hit"); setTimeout(() => el.classList.remove("hit"), 80); }
+}
+
+function playMetronome(when, accent) {
+  ensureAudio();
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.value = accent ? 1200 : 800;
+  g.gain.setValueAtTime(0, when);
+  g.gain.linearRampToValueAtTime(state.metroVol * 0.4, when + 0.001);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+  o.connect(g); g.connect(masterGain); o.start(when); o.stop(when + 0.06);
+}
+
+function secondsPerStep() { return (60 / state.bpm) / 4; }
+function swingOffset(step) {
+  if (state.swing <= 0) return 0;
+  if (step % 2 === 1) return secondsPerStep() * state.swing * 0.5;
+  return 0;
+}
+function applyPunchFx(when) {
+  if (!ctx || state.punchFx.size === 0) return;
+  const f = groupFilters[state.group];
+  if (state.punchFx.has(0)) f.frequency.setTargetAtTime(400, when, 0.05);
+  if (state.punchFx.has(1)) f.frequency.setTargetAtTime(12000, when, 0.05);
+  if (state.punchFx.has(2)) masterGain.gain.setTargetAtTime(state.volume * 1.3, when, 0.02);
+  if (state.punchFx.has(3)) masterGain.gain.setTargetAtTime(state.volume * 0.2, when, 0.02);
+  if (state.punchFx.has(4)) delayFeedback.gain.setTargetAtTime(0.85, when, 0.05);
+  if (state.punchFx.has(5)) reverbGain.gain.setTargetAtTime(0.95, when, 0.05);
+}
+function clearPunchFx() {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  groupFilters[state.group].frequency.setTargetAtTime(18000, t, 0.08);
+  masterGain.gain.setTargetAtTime(state.volume, t, 0.05);
+}
+
+function scheduleStep(step, when) {
+  if (state.countIn > 0) { playMetronome(when, state.countIn % 4 === 0); return; }
+  if (state.metronome && step % 4 === 0) playMetronome(when, step % 16 === 0);
+  for (let g = 0; g < 4; g++) {
+    if (state.soloGroups && !state.soloGroups.has(g)) continue;
+    for (const n of patterns[g].filter(n => n.step === step)) {
+      playSound(g, n.pad, when + (n.offset || 0), n.vel == null ? 1 : n.vel, n.pitch || 0);
+    }
+  }
+  applyPunchFx(when);
+  stepInBar = step; state.currentStep = step;
+  if (Math.abs(when - ctx.currentTime) < 0.08) {
+    requestAnimationFrame(() => { lcd(String(step + 1).padStart(3, "0")); updatePadLights(); });
+  }
+}
+function advanceStep() {
+  if (state.countIn > 0) {
+    state.countIn--; nextNoteTime += secondsPerStep();
+    if (state.countIn === 0) { stepInBar = 0; state.recording = true; state.recordArmed = false; lcd("REC", true); }
+    return;
+  }
+  const step = stepInBar;
+  nextNoteTime += secondsPerStep() + swingOffset(step);
+  stepInBar = (step + 1) >= state.patternLength ? 0 : step + 1;
+}
+function schedulerTick() {
+  if (!state.playing || !ctx) return;
+  while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD) {
+    scheduleStep(stepInBar, nextNoteTime); advanceStep();
+  }
+}
+function startPlay(opts) {
+  opts = opts || {};
+  ensureAudio(); ctx.resume();
+  if (state.playing) return;
+  state.playing = true;
+  stepInBar = opts.fromStart ? 0 : state.currentStep;
+  nextNoteTime = ctx.currentTime + 0.05;
+  if (opts.countIn) { state.countIn = 4; state.recordArmed = true; lcd("CNT"); }
+  else {
+    state.countIn = 0;
+    if (opts.record) { state.recording = true; lcd("REC", true); } else lcd("PLY");
+  }
+  setStatus();
+  schedulerTimer = setInterval(schedulerTick, LOOKAHEAD * 1000);
+  schedulerTick();
+}
+function stopPlay() {
+  state.playing = false; state.recording = false; state.recordArmed = false; state.countIn = 0;
+  if (schedulerTimer) { clearInterval(schedulerTimer); schedulerTimer = null; }
+  lcd(String(state.currentStep + 1).padStart(3, "0")); setStatus();
+}
+function addNote(group, pad, step, vel) {
+  patterns[group] = patterns[group].filter(n => !(n.step === step && n.pad === pad));
+  patterns[group].push({ step, pad, vel: vel == null ? 1 : vel, pitch: 0, offset: 0 });
+}
+function erasePadNotes(group, pad) { patterns[group] = patterns[group].filter(n => n.pad !== pad); }
+
+let mediaStream = null, mediaRecorder = null, recordChunks = [], recordingPad = -1, recordScript = null;
+
+function hitPad(padIndex, vel, down) {
+  vel = vel == null ? 1 : vel; down = down !== false;
+  ensureAudio(); if (ctx.state === "suspended") ctx.resume();
+
+  if (state.mode === "fx" && state.fxHeld) {
+    if (down) state.punchFx.add(padIndex); else state.punchFx.delete(padIndex);
+    if (!down && state.punchFx.size === 0) clearPunchFx();
+    lcd("PF" + padIndex); return;
+  }
+  if (state.mode === "sample") {
+    if (down) startSampleRecord(padIndex); else stopSampleRecord();
+    return;
+  }
+  if (state.faderHold && down) {
+    state.faderAssign = padIndex; lcd(FADER_ASSIGNS[padIndex].slice(0, 3));
+    toast("Fader → " + FADER_ASSIGNS[padIndex]); return;
+  }
+  if (!state.playing && state.recording && down) {
+    addNote(state.group, padIndex, state.currentStep, vel);
+    playSound(state.group, padIndex, ctx.currentTime, vel);
+    lcd("S" + String(state.currentStep + 1).padStart(2, "0")); updatePadLights(); return;
+  }
+  if (state.eraseHeld && down) {
+    erasePadNotes(state.group, padIndex); lcd(state.playing ? "ERS" : "TRK"); updatePadLights(); return;
+  }
+  if (!down) {
+    const snd = pads[state.group][state.keysMode ? state.keysRootPad : padIndex];
+    if (snd && (snd.playMode === 2 || snd.playMode === 3) && !state.keysMode) stopVoice(state.group + ":" + padIndex, ctx.currentTime);
+    return;
+  }
+  state.selectedPad = padIndex;
+  let pitchOff = 0, g = state.group, p = padIndex;
+  if (state.keysMode) { p = state.keysRootPad; pitchOff = (padIndex - 5) + state.keysOctave * 12; }
+  playSound(g, p, ctx.currentTime, vel, pitchOff);
+  if (state.recording && state.playing) {
+    patterns[state.group].push({ step: stepInBar, pad: state.keysMode ? state.keysRootPad : padIndex, vel, pitch: pitchOff, offset: 0 });
+  }
+  if (state.mode === "sound" || state.mode === "edit") {
+    const snd = pads[state.group][padIndex]; lcd(snd && snd.name ? snd.name.slice(0, 3) : "---");
+  } else if (state.mode === "main") lcd(PAD_LABELS[padIndex].slice(0, 3));
+  setStatus();
+}
+
+async function startSampleRecord(padIndex) {
+  ensureAudio(); recordingPad = padIndex; lcd("MIC", true);
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const src = ctx.createMediaStreamSource(mediaStream);
+    mediaRecorder = new MediaRecorder(mediaStream);
+    recordChunks = [];
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordChunks.push(e.data); };
+    mediaRecorder.onstop = () => { if (mediaStream) mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; };
+    mediaRecorder.start();
+    recordScript = ctx.createScriptProcessor(4096, 1, 1);
+    const pcm = [];
+    recordScript.onaudioprocess = (e) => { if (recordingPad >= 0) pcm.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    recordScript._pcm = pcm;
+    const silent = ctx.createGain(); silent.gain.value = 0;
+    src.connect(recordScript); recordScript.connect(silent); silent.connect(ctx.destination);
+  } catch (err) { lcd("DEN"); toast("Mic permission denied"); console.warn(err); }
+}
+function stopSampleRecord() {
+  const padIndex = recordingPad;
+  if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
+  const proc = recordScript;
+  if (proc && proc._pcm && proc._pcm.length && ctx && padIndex >= 0) {
+    const pcm = proc._pcm; let len = 0; pcm.forEach(a => len += a.length);
+    if (len > 0) {
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d = buf.getChannelData(0); let o = 0;
+      for (const a of pcm) { d.set(a, o); o += a.length; }
+      const fade = Math.min(256, Math.floor(len / 4));
+      for (let i = 0; i < fade; i++) { d[i] *= i / fade; d[len - 1 - i] *= i / fade; }
+      pads[state.group][padIndex] = defaultSound(buf, "SMP");
+      lcd("OK!"); toast("Sampled pad " + PAD_LABELS[padIndex]); updatePadLights();
+    }
+    try { proc.disconnect(); } catch (_) {}
+  }
+  recordingPad = -1; recordScript = null;
+}
+
+async function loadAudioToPad(file, group, padIndex) {
+  ensureAudio();
+  const arr = await file.arrayBuffer();
+  const buf = await ctx.decodeAudioData(arr.slice(0));
+  pads[group][padIndex] = defaultSound(buf, file.name.slice(0, 3).toUpperCase());
+  lcd("LOD"); toast("Loaded " + file.name); updatePadLights();
+}
+function chopSelected() {
+  const snd = pads[state.group][state.selectedPad];
+  if (!snd || !snd.buffer) { toast("Select a pad with a sample first"); lcd("NON"); return; }
+  for (let i = 0; i < 12; i++) {
+    pads[state.group][i] = Object.assign({}, snd, { name: "CH" + (i + 1), start: i / 12, end: (i + 1) / 12, buffer: snd.buffer, playMode: 0 });
+  }
+  lcd("CHP"); toast("Chopped into 12 slices"); updatePadLights();
+}
+
+function adjustSelected(param, delta) {
+  const snd = pads[state.group][state.selectedPad]; if (!snd) return;
+  switch (param) {
+    case "level": snd.level = clamp(snd.level + delta, 0, 1.5); lcd(Math.round(snd.level * 100)); break;
+    case "pitch": snd.pitch = clamp(snd.pitch + delta * 12, -24, 24); lcd((snd.pitch >= 0 ? "+" : "") + Math.round(snd.pitch)); break;
+    case "tune": snd.tune = clamp(snd.tune + delta * 2, -12, 12); lcd(Math.round(snd.tune * 10)); break;
+    case "lpf": snd.lpf = clamp(snd.lpf * (1 + delta), 200, 18000); lcd(Math.round(snd.lpf / 100)); break;
+    case "hpf": snd.hpf = clamp(snd.hpf + delta * 200, 20, 8000); lcd(Math.round(snd.hpf / 10)); break;
+    case "atk": snd.atk = clamp(snd.atk + delta * 0.1, 0.001, 2); lcd(Math.round(snd.atk * 100)); break;
+    case "rel": snd.rel = clamp(snd.rel + delta * 0.1, 0.01, 2); lcd(Math.round(snd.rel * 100)); break;
+    case "pan": snd.pan = clamp(snd.pan + delta, -1, 1); lcd(Math.round(snd.pan * 50)); break;
+    case "time": snd.timeStretch = clamp(snd.timeStretch + delta, 0.25, 4); lcd(Math.round(snd.timeStretch * 100)); break;
+    case "fx": snd.fxSend = clamp(snd.fxSend + delta, 0, 1); groupFxSends[state.group].gain.value = snd.fxSend; lcd(Math.round(snd.fxSend * 100)); break;
+    case "mode": snd.playMode = (snd.playMode + (delta > 0 ? 1 : 3)) % 4; lcd(PLAY_MODES[snd.playMode]); break;
+    case "start": snd.start = clamp(snd.start + delta * 0.05, 0, snd.end - 0.01); lcd(Math.round(snd.start * 100)); break;
+    case "end": snd.end = clamp(snd.end + delta * 0.05, snd.start + 0.01, 1); lcd(Math.round(snd.end * 100)); break;
+  }
+}
+
+function bindKnob(el, onChange) {
+  let dragging = false, lastY = 0;
+  const start = (y) => { dragging = true; lastY = y; ensureAudio(); };
+  const move = (y) => { if (!dragging) return; const dy = lastY - y; lastY = y; onChange(dy * 0.005); };
+  const end = () => { dragging = false; };
+  el.addEventListener("mousedown", (e) => { e.preventDefault(); start(e.clientY); });
+  window.addEventListener("mousemove", (e) => move(e.clientY));
+  window.addEventListener("mouseup", end);
+  el.addEventListener("touchstart", (e) => start(e.touches[0].clientY), { passive: true });
+  el.addEventListener("touchmove", (e) => move(e.touches[0].clientY), { passive: true });
+  el.addEventListener("touchend", end);
+}
+function setKnobAngle(el, norm) { el.style.setProperty("--angle", (-135 + norm * 270) + "deg"); }
+
+function onKnobX(delta) {
+  delta *= state.shift ? 0.25 : 1;
+  if (state.mode === "tempo" || state.mode === "main") {
+    state.bpm = clamp(Math.round(state.bpm + delta * 40), 40, 240);
+    setKnobAngle(document.getElementById("knobX"), (state.bpm - 40) / 200); lcd(String(state.bpm));
+  } else if (state.mode === "fx") {
+    state.fxParams.x = clamp(state.fxParams.x + delta, 0, 1);
+    setKnobAngle(document.getElementById("knobX"), state.fxParams.x); applyFx(); lcd(Math.round(state.fxParams.x * 100));
+  } else if (state.mode === "sound" || state.mode === "edit") {
+    const map = ["level","start","atk","time","mode","lpf"];
+    adjustSelected(map[state.editPage] || "level", delta);
+  } else if (state.mode === "timing") {
+    const opts = [1, 2, 4, 8, 16, 32];
+    let i = opts.indexOf(state.noteInterval); if (i < 0) i = 4;
+    if (Math.abs(delta) > 0.02) { i = clamp(i + (delta > 0 ? 1 : -1), 0, opts.length - 1); state.noteInterval = opts[i]; lcd("1/" + state.noteInterval); }
+  } else adjustSelected("level", delta);
+  setStatus();
+}
+function onKnobY(delta) {
+  delta *= state.shift ? 0.25 : 1;
+  if (state.mode === "tempo" || state.mode === "timing" || state.mode === "main") {
+    state.swing = clamp(state.swing + delta, 0, 1);
+    setKnobAngle(document.getElementById("knobY"), state.swing); lcd("SW" + Math.round(state.swing * 10));
+  } else if (state.mode === "fx") {
+    state.fxParams.y = clamp(state.fxParams.y + delta, 0, 1);
+    setKnobAngle(document.getElementById("knobY"), state.fxParams.y); applyFx(); lcd(Math.round(state.fxParams.y * 100));
+  } else if (state.mode === "sound" || state.mode === "edit") {
+    const map = ["pitch","end","rel","tune","pan","hpf"];
+    adjustSelected(map[state.editPage] || "pitch", delta);
+  } else { state.metroVol = clamp(state.metroVol + delta, 0, 1); lcd("MT" + Math.round(state.metroVol * 10)); }
+  setStatus();
+}
+function onVol(delta) {
+  state.volume = clamp(state.volume + delta, 0, 1);
+  setKnobAngle(document.getElementById("knobVol"), state.volume);
+  if (masterGain && ctx) masterGain.gain.setTargetAtTime(state.volume, ctx.currentTime, 0.02);
+  lcd(Math.round(state.volume * 100));
+}
+function setFader(norm) {
+  state.fader = clamp(norm, 0, 1);
+  document.getElementById("faderCap").style.top = ((1 - state.fader) * 100) + "%";
+  if (!ctx) return;
+  const t = ctx.currentTime, g = state.group, fa = FADER_ASSIGNS[state.faderAssign];
+  if (fa === "LEVEL") groupGains[g].gain.setTargetAtTime(0.05 + state.fader * 0.95, t, 0.02);
+  if (fa === "FX") groupFxSends[g].gain.setTargetAtTime(state.fader, t, 0.02);
+  if (fa === "LPF") { groupFilters[g].type = "lowpass"; groupFilters[g].frequency.setTargetAtTime(lerp(200, 18000, state.fader), t, 0.03); }
+  if (fa === "HPF") { groupFilters[g].type = "highpass"; groupFilters[g].frequency.setTargetAtTime(lerp(20, 4000, state.fader), t, 0.03); }
+  lcd(Math.round(state.fader * 100));
+}
+function bindFader() {
+  const track = document.getElementById("faderTrack");
+  const update = (clientY) => {
+    const rect = track.getBoundingClientRect();
+    setFader(1 - (clientY - rect.top) / rect.height);
+  };
+  track.addEventListener("mousedown", (e) => {
+    e.preventDefault(); ensureAudio();
+    const move = (ev) => update(ev.clientY);
+    const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    update(e.clientY); window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  });
+  track.addEventListener("touchstart", (e) => update(e.touches[0].clientY), { passive: true });
+  track.addEventListener("touchmove", (e) => update(e.touches[0].clientY), { passive: true });
+}
+
+function setMode(m) { state.mode = m; lcd(m.slice(0, 3).toUpperCase()); setStatus(); }
+
+function onButton(name, down) {
+  ensureAudio();
+  if (name === "shift") { state.shift = down; setStatus(); return; }
+  if (!down) {
+    if (name === "fx") { state.fxHeld = false; if (state.punchFx.size) { state.punchFx.clear(); clearPunchFx(); } }
+    if (name === "erase") state.eraseHeld = false;
+    if (name === "fader") state.faderHold = false;
+    return;
+  }
+  switch (name) {
+    case "main":
+      if (state.shift) {
+        scenes.push({ name: String(scenes.length + 1) });
+        state.scene = scenes.length - 1; state.song.push(state.scene);
+        lcd("COM"); toast("Committed scene " + scenes.length);
+      } else setMode("main");
+      break;
+    case "sound":
+      if (state.shift) { setMode("edit"); state.editPage = 0; lcd("ED0"); }
+      else setMode("sound");
+      break;
+    case "tempo":
+      if (state.shift) {
+        const lens = [8, 16, 32, 64];
+        let i = lens.indexOf(state.patternLength);
+        state.patternLength = lens[(i + 1) % lens.length];
+        lcd("L" + String(state.patternLength).padStart(2, "0"));
+        toast("Pattern length " + state.patternLength);
+      } else setMode("tempo");
+      break;
+    case "sample":
+      if (state.shift) { setMode("chop"); chopSelected(); }
+      else setMode("sample");
+      break;
+    case "timing":
+      if (state.shift) {
+        patterns[state.group].forEach(n => { n.offset = 0; });
+        lcd("TC"); toast("Timing correct");
+      } else { setMode("timing"); state.quantize = !state.quantize; lcd(state.quantize ? "QNT" : "FRE"); }
+      break;
+    case "fx":
+      state.fxHeld = true;
+      if (state.shift) { lcd("CMP"); toast("Master compressor"); } else setMode("fx");
+      break;
+    case "erase":
+      state.eraseHeld = true;
+      if (state.shift) { lcd("SYS"); toast("Use Save/Load in toolbar"); }
+      break;
+    case "keys":
+      state.keysMode = !state.keysMode;
+      if (state.keysMode) state.keysRootPad = state.selectedPad;
+      lcd(state.keysMode ? "KEY" : "OFF"); setStatus();
+      break;
+    case "fader":
+      state.faderHold = true; lcd(FADER_ASSIGNS[state.faderAssign].slice(0, 3));
+      break;
+    case "record":
+      if (state.playing) { state.recording = !state.recording; lcd(state.recording ? "REC" : "PLY"); }
+      else { state.recording = !state.recording; state.recordArmed = state.recording; lcd(state.recording ? "ARM" : "---"); }
+      setStatus();
+      break;
+    case "play":
+      if (state.playing) stopPlay();
+      else if (state.recordArmed || state.recording) startPlay({ countIn: !state.shift, record: true, fromStart: !!state.shift });
+      else startPlay({ fromStart: !!state.shift });
+      break;
+    case "minus": handleMinusPlus(-1); break;
+    case "plus": handleMinusPlus(1); break;
+  }
+  setStatus();
+}
+
+function handleMinusPlus(dir) {
+  if (state.mode === "fx") {
+    state.fxIndex = (state.fxIndex + dir + FX_NAMES.length) % FX_NAMES.length;
+    applyFx(); lcd(FX_NAMES[state.fxIndex]); toast(FX_NAMES[state.fxIndex]);
+  } else if (state.mode === "sound") adjustSelected("level", dir * 0.05);
+  else if (state.mode === "edit") {
+    state.editPage = (state.editPage + dir + 6) % 6;
+    lcd(["SND","TRM","ENV","TIM","MOD","FLT"][state.editPage]);
+  } else if (state.mode === "tempo") { state.bpm = clamp(state.bpm + dir, 40, 240); lcd(String(state.bpm)); }
+  else if (state.keysMode && state.shift) {
+    state.keysOctave = clamp(state.keysOctave + dir, -3, 3);
+    lcd("O" + (state.keysOctave >= 0 ? "+" : "") + state.keysOctave);
+  } else if (state.recording && !state.playing) {
+    state.patternLength = clamp(state.patternLength + dir * 16, 16, 64);
+    lcd("L" + String(state.patternLength).padStart(2, "0"));
+  } else if (!state.playing) {
+    state.currentStep = (state.currentStep + dir + state.patternLength) % state.patternLength;
+    lcd(String(state.currentStep + 1).padStart(3, "0")); updatePadLights();
+  } else {
+    state.scene = clamp(state.scene + dir, 0, Math.max(0, scenes.length - 1));
+    lcd("SC" + (state.scene + 1));
+  }
+}
+
+function bufferToBase64(buffer) {
+  if (!buffer) return null;
+  const nCh = buffer.numberOfChannels, len = buffer.length, sr = buffer.sampleRate;
+  const pcm = new Float32Array(len * nCh);
+  for (let c = 0; c < nCh; c++) { const d = buffer.getChannelData(c); for (let i = 0; i < len; i++) pcm[i * nCh + c] = d[i]; }
+  const bytes = new Uint8Array(pcm.buffer);
+  let s = ""; const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  return { sr, nCh, len, data: btoa(s) };
+}
+function base64ToBuffer(obj) {
+  if (!obj) return null;
+  ensureAudio();
+  const bin = atob(obj.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const pcm = new Float32Array(bytes.buffer);
+  const buf = ctx.createBuffer(obj.nCh, obj.len, obj.sr);
+  for (let c = 0; c < obj.nCh; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < obj.len; i++) d[i] = pcm[i * obj.nCh + c];
+  }
+  return buf;
+}
+function serializeProject() {
+  return {
+    version: 1, bpm: state.bpm, swing: state.swing, patternLength: state.patternLength,
+    patterns: patterns.map(p => p.slice()),
+    groups: pads.map(g => g.map(s => ({
+      name: s.name, level: s.level, pitch: s.pitch, tune: s.tune, start: s.start, end: s.end,
+      lpf: s.lpf, hpf: s.hpf, atk: s.atk, rel: s.rel, pan: s.pan, vel: s.vel, playMode: s.playMode,
+      timeStretch: s.timeStretch, fxSend: s.fxSend, buffer: bufferToBase64(s.buffer),
+    }))),
+    fxIndex: state.fxIndex, fxParams: state.fxParams, scene: state.scene, song: state.song,
+  };
+}
+function saveLocal() {
+  try {
+    localStorage.setItem("ko2-project", JSON.stringify(serializeProject()));
+    lcd("SAV"); toast("Saved to localStorage");
+  } catch (e) { lcd("FUL"); toast("Save failed — try Export"); console.warn(e); }
+}
+async function loadLocal() {
+  const raw = localStorage.getItem("ko2-project");
+  if (!raw) { toast("No saved project"); lcd("NON"); return; }
+  await applyProject(JSON.parse(raw)); lcd("LOD"); toast("Loaded from localStorage");
+}
+async function applyProject(data) {
+  ensureAudio();
+  state.bpm = data.bpm || 120; state.swing = data.swing || 0; state.patternLength = data.patternLength || 16;
+  state.fxIndex = data.fxIndex || 0; state.fxParams = data.fxParams || { x: 0.4, y: 0.3 };
+  for (let g = 0; g < 4; g++) {
+    patterns[g] = (data.patterns && data.patterns[g]) ? data.patterns[g].slice() : [];
+    if (data.groups && data.groups[g]) {
+      pads[g] = data.groups[g].map(s => {
+        const snd = defaultSound(null, s.name || "---");
+        Object.assign(snd, s); snd.buffer = base64ToBuffer(s.buffer); return snd;
+      });
+    }
+  }
+  applyFx();
+  setKnobAngle(document.getElementById("knobX"), (state.bpm - 40) / 200);
+  setKnobAngle(document.getElementById("knobY"), state.swing);
+  updatePadLights(); setStatus();
+}
+function exportJson() {
+  const blob = new Blob([JSON.stringify(serializeProject())], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ko2-project.json"; a.click();
+  lcd("EXP"); toast("Exported JSON");
+}
+function importJson(file) {
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try { await applyProject(JSON.parse(reader.result)); lcd("IMP"); toast("Imported"); }
+    catch (e) { lcd("ERR"); toast("Import failed"); console.warn(e); }
+  };
+  reader.readAsText(file);
+}
+
+async function bounceWav() {
+  ensureAudio(); toast("Rendering…"); lcd("RND", true);
+  const sr = 44100, steps = state.patternLength, sp = (60 / state.bpm) / 4;
+  const dur = steps * sp + 1.5;
+  const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
+  function playOffline(og, padIndex, when, vel, pitchOff) {
+    const snd = pads[og][padIndex]; if (!snd || !snd.buffer) return;
+    const src = offline.createBufferSource(); src.buffer = snd.buffer;
+    src.playbackRate.value = Math.pow(2, (snd.pitch + snd.tune + (pitchOff || 0)) / 12);
+    const g = offline.createGain(); const level = snd.level * (vel == null ? 1 : vel);
+    g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(level, when + snd.atk);
+    const startOff = snd.start * snd.buffer.duration, endOff = snd.end * snd.buffer.duration;
+    const pdur = Math.max(0.01, (endOff - startOff) / src.playbackRate.value);
+    g.gain.setValueAtTime(level, when + Math.max(0, pdur - snd.rel));
+    g.gain.linearRampToValueAtTime(0.0001, when + pdur);
+    src.connect(g); g.connect(offline.destination);
+    try { src.start(when, startOff, pdur + snd.rel); } catch (_) {}
+  }
+  for (let step = 0; step < steps; step++) {
+    const when = step * sp + 0.05;
+    for (let g = 0; g < 4; g++) for (const n of patterns[g].filter(x => x.step === step))
+      playOffline(g, n.pad, when, n.vel, n.pitch);
+  }
+  const rendered = await offline.startRendering();
+  const wav = audioBufferToWav(rendered);
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+  a.download = "ko2-bounce.wav"; a.click(); lcd("WAV"); toast("Bounce downloaded");
+}
+function audioBufferToWav(buffer) {
+  const nCh = buffer.numberOfChannels, sr = buffer.sampleRate, len = buffer.length;
+  const dataLen = len * nCh * 2; const ab = new ArrayBuffer(44 + dataLen); const v = new DataView(ab);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + dataLen, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, nCh, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * nCh * 2, true);
+  v.setUint16(32, nCh * 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, dataLen, true);
+  let off = 44; const chans = []; for (let c = 0; c < nCh; c++) chans.push(buffer.getChannelData(c));
+  for (let i = 0; i < len; i++) for (let c = 0; c < nCh; c++) {
+    let x = Math.max(-1, Math.min(1, chans[c][i]));
+    v.setInt16(off, x < 0 ? x * 0x8000 : x * 0x7fff, true); off += 2;
+  }
+  return ab;
+}
+
+function buildPads() {
+  const root = document.getElementById("pads"); root.innerHTML = "";
+  // 4 rows with label row above each
+  const rows = [
+    { labels: ["LEVEL","PITCH","TIME"], pads: [0,1,2] },
+    { labels: ["LPF","HPF","→FX"], pads: [3,4,5] },
+    { labels: ["ATK","REL","PAN"], pads: [6,7,8] },
+    { labels: ["TUNE","VEL","MOD"], pads: [9,10,11] },
+  ];
+  rows.forEach((row) => {
+    const lab = document.createElement("div");
+    lab.className = "pad-lab-row";
+    row.labels.forEach((t) => {
+      const s = document.createElement("span");
+      s.innerHTML = '<i class="dot"></i>' + t;
+      lab.appendChild(s);
+    });
+    root.appendChild(lab);
+    const prow = document.createElement("div");
+    prow.className = "pad-row";
+    row.pads.forEach((i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "pad";
+      b.dataset.pad = i;
+      b.textContent = PAD_LABELS[i];
+      const down = (e) => { e.preventDefault(); hitPad(i, 1, true); };
+      const up = (e) => { e.preventDefault(); hitPad(i, 1, false); };
+      b.addEventListener("mousedown", down); b.addEventListener("mouseup", up); b.addEventListener("mouseleave", up);
+      b.addEventListener("touchstart", down, { passive: false }); b.addEventListener("touchend", up, { passive: false });
+      b.addEventListener("dragover", (e) => { e.preventDefault(); b.style.outline = "2px solid #e85a1a"; });
+      b.addEventListener("dragleave", () => { b.style.outline = ""; });
+      b.addEventListener("drop", async (e) => {
+        e.preventDefault(); b.style.outline = "";
+        const f = e.dataTransfer.files[0]; if (f) await loadAudioToPad(f, state.group, i);
+      });
+      prow.appendChild(b);
+    });
+    root.appendChild(prow);
+  });
+}
+
+function bindUI() {
+  buildPads();
+  document.querySelectorAll(".group-btn").forEach((b) => {
+    b.addEventListener("click", () => {
+      const g = +b.dataset.group;
+      if (state.fxHeld) {
+        if (!state.soloGroups) state.soloGroups = new Set();
+        if (state.soloGroups.has(g)) state.soloGroups.delete(g); else state.soloGroups.add(g);
+        if (state.soloGroups.size === 0) state.soloGroups = null;
+        lcd("SOL"); return;
+      }
+      if (state.eraseHeld) {
+        patterns[g] = []; lcd("PTN"); toast("Erased pattern " + "ABCD"[g]); updatePadLights(); return;
+      }
+      state.group = g; lcd(" " + "ABCD"[g] + " "); setStatus();
+    });
+  });
+  ["sound","main","tempo","sample","timing","fx","erase","keys","fader","record","play","minus","plus","shift"].forEach((name) => {
+    const el = document.querySelector('[data-btn="' + name + '"]'); if (!el) return;
+    el.addEventListener("mousedown", (e) => { e.preventDefault(); onButton(name, true); });
+    el.addEventListener("mouseup", () => onButton(name, false));
+    el.addEventListener("mouseleave", () => onButton(name, false));
+    el.addEventListener("touchstart", (e) => { e.preventDefault(); onButton(name, true); }, { passive: false });
+    el.addEventListener("touchend", (e) => { e.preventDefault(); onButton(name, false); }, { passive: false });
+  });
+  bindKnob(document.getElementById("knobX"), onKnobX);
+  bindKnob(document.getElementById("knobY"), onKnobY);
+  bindKnob(document.getElementById("knobVol"), onVol);
+  bindFader(); setFader(0.8);
+  setKnobAngle(document.getElementById("knobVol"), state.volume);
+  setKnobAngle(document.getElementById("knobX"), (state.bpm - 40) / 200);
+  setKnobAngle(document.getElementById("knobY"), state.swing);
+
+  document.getElementById("btnHelp").onclick = () => document.getElementById("help").classList.add("open");
+  document.getElementById("closeHelp").onclick = () => document.getElementById("help").classList.remove("open");
+  document.getElementById("help").addEventListener("click", (e) => { if (e.target.id === "help") e.target.classList.remove("open"); });
+  document.getElementById("btnSave").onclick = saveLocal;
+  document.getElementById("btnLoad").onclick = loadLocal;
+  document.getElementById("btnExport").onclick = exportJson;
+  document.getElementById("btnImport").onclick = () => document.getElementById("fileJson").click();
+  document.getElementById("fileJson").onchange = (e) => { if (e.target.files[0]) importJson(e.target.files[0]); };
+  document.getElementById("btnBounce").onclick = () => bounceWav().catch(err => { console.warn(err); toast("Bounce failed"); });
+  document.getElementById("fileAudio").onchange = async (e) => {
+    const files = [...e.target.files];
+    for (let i = 0; i < files.length; i++) await loadAudioToPad(files[i], state.group, (state.selectedPad + i) % 12);
+  };
+  document.querySelector(".toolbar label").addEventListener("click", () => document.getElementById("fileAudio").click());
+  document.getElementById("device").addEventListener("click", () => { ensureAudio(); if (ctx.state === "suspended") ctx.resume(); });
+
+  const padKeys = {
+    Digit7:0, Digit8:1, Digit9:2, KeyU:0, KeyI:1, KeyO:2,
+    Digit4:3, Digit5:4, Digit6:5, KeyJ:3, KeyK:4, KeyL:5,
+    Digit1:6, Digit2:7, Digit3:8, KeyM:9, Comma:10, Period:11,
+    Numpad7:0, Numpad8:1, Numpad9:2, Numpad4:3, Numpad5:4, Numpad6:5,
+    Numpad1:6, Numpad2:7, Numpad3:8, Numpad0:10, NumpadDecimal:9, NumpadEnter:11,
+  };
+  const heldKeys = new Set();
+  window.addEventListener("keydown", (e) => {
+    if (e.repeat) return;
+    if ((e.code === "Slash" && e.shiftKey) || e.key === "?" || e.key === "h" || e.key === "H") {
+      if (!e.metaKey && !e.ctrlKey) { document.getElementById("help").classList.toggle("open"); return; }
+    }
+    if (e.code === "Space") { e.preventDefault(); onButton("play", true); return; }
+    if (e.code === "KeyR") { onButton("record", true); return; }
+    if (e.key === "Shift") { onButton("shift", true); return; }
+    if (e.code === "BracketLeft") { onButton("minus", true); return; }
+    if (e.code === "BracketRight") { onButton("plus", true); return; }
+    if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey) { onButton("sample", true); return; }
+    if (e.code === "KeyF" && !e.metaKey) { onButton("fx", true); return; }
+    if (e.code === "KeyA") { state.group = 0; setStatus(); lcd(" A "); return; }
+    if (e.code === "KeyB") { state.group = 1; setStatus(); lcd(" B "); return; }
+    if (e.code === "KeyC") { state.group = 2; setStatus(); lcd(" C "); return; }
+    if (e.code === "KeyD") { state.group = 3; setStatus(); lcd(" D "); return; }
+    if (e.code === "KeyQ") { onButton("sound", true); return; }
+    if (e.code === "KeyW") { onButton("main", true); return; }
+    if (e.code === "KeyE") { onButton("tempo", true); return; }
+    if (e.code === "KeyT") { onButton("timing", true); return; }
+    if (e.code === "KeyX") { onButton("erase", true); return; }
+    if (e.code === "KeyZ") { onButton("keys", true); return; }
+    const pi = padKeys[e.code];
+    if (pi != null) { e.preventDefault(); heldKeys.add(e.code); hitPad(pi, 1, true); }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space") { onButton("play", false); return; }
+    if (e.code === "KeyR") { onButton("record", false); return; }
+    if (e.key === "Shift") { onButton("shift", false); return; }
+    if (e.code === "KeyS") { onButton("sample", false); return; }
+    if (e.code === "KeyF") { onButton("fx", false); return; }
+    if (e.code === "KeyX") { onButton("erase", false); return; }
+    if (padKeys[e.code] != null && heldKeys.has(e.code)) { heldKeys.delete(e.code); hitPad(padKeys[e.code], 1, false); }
+  });
+}
+
+function seedDemoPattern() {
+  const A = 0;
+  for (const s of [0, 4, 8, 12]) addNote(A, 0, s, 1);
+  for (const s of [4, 12]) addNote(A, 1, s, 1);
+  for (let s = 0; s < 16; s += 2) addNote(A, 2, s, s % 4 === 0 ? 0.7 : 0.45);
+  addNote(A, 3, 14, 0.6); addNote(A, 4, 10, 0.8);
+}
+
+function init() {
+  bindUI();
+  try { loadDefaultKit(); seedDemoPattern(); }
+  catch (e) {
+    console.warn("Eager audio init deferred", e);
+    document.body.addEventListener("click", () => {
+      if (!pads[0][0] || !pads[0][0].buffer) { loadDefaultKit(); seedDemoPattern(); }
+    }, { once: true });
+  }
+  lcd("KO2"); setStatus();
+  window.__ko2 = { state, pads, patterns, ensureAudio, hitPad, startPlay, stopPlay, loadDefaultKit, playSound, lcd, chopSelected, serializeProject, applyProject };
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+else init();
+})();

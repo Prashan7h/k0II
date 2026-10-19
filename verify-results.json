@@ -1,0 +1,34 @@
+[
+  {
+    "name": "chromium",
+    "errors": [],
+    "result": {
+      "ok": true,
+      "checks": {
+        "hasKick": true,
+        "hasBass": true,
+        "padCount": 12,
+        "velSoft": 0.5,
+        "velHard": 0.2871745887492587,
+        "scenes": true,
+        "punch": true,
+        "playing": true,
+        "stepMoved": true,
+        "stopped": true,
+        "stretch": true,
+        "bouncePeak": 1.030815601348877,
+        "bounceOk": true,
+        "serialize": true
+      }
+    }
+  },
+  {
+    "name": "webkit",
+    "errors": [
+      "Error: browserType.launch: \n╔══════════════════════════════════════════════════════╗\n║ Host system is missing dependencies to run browsers. ║\n║ Missing libraries:                                   ║\n║     libgtk-4.so.1                                    ║\n║     libgraphene-1.0.so.0                             ║\n║     libevent-2.1.so.7                                ║\n║     libgstgl-1.0.so.0                                ║\n║     libgstcodecparsers-1.0.so.0                      ║\n║     libavif.so.16                                    ║\n║     libmanette-0.2.so.0                              ║\n║     libenchant-2.so.2                                ║\n║     libsecret-1.so.0                                 ║\n║     libGLESv2.so.2                                   ║\n╚══════════════════════════════════════════════════════╝"
+    ],
+    "result": {
+      "ok": false
+    }
+  }
+]

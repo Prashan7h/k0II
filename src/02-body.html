@@ -1,0 +1,137 @@
+<div class="toolbar">
+  <button type="button" id="btnHelp">Help</button>
+  <button type="button" id="btnSave">Save</button>
+  <button type="button" id="btnLoad">Load</button>
+  <button type="button" id="btnExport">Export</button>
+  <button type="button" id="btnImport">Import</button>
+  <button type="button" id="btnBounce">Bounce WAV</button>
+  <label>Audio<input type="file" id="fileAudio" accept="audio/*" hidden multiple /></label>
+  <input type="file" id="fileJson" accept="application/json,.json" hidden />
+  <select id="velCurve" title="Velocity curve">
+    <option value="soft">Vel: Soft</option>
+    <option value="linear" selected>Vel: Linear</option>
+    <option value="hard">Vel: Hard</option>
+    <option value="fixed">Vel: Fixed</option>
+  </select>
+  <button type="button" id="btnMidi">MIDI</button>
+  <button type="button" id="btnLayers">Vel Layers</button>
+  <button type="button" id="btnStepLock">Step Lock</button>
+  <span class="lock-badge" id="lockBadge">STEP LOCK</span>
+  <span class="hint">Space = Play · Force Touch / stylus pressure · Drop audio on pads</span>
+</div>
+
+<div class="device-stage"><div class="device" id="device">
+  <div class="ports">
+    <span class="port out">Output</span>
+    <span class="port in">Input</span>
+    <span class="port blk">Sync<span class="leds"><i id="ledSync"></i><i></i></span></span>
+    <span class="port blk">MIDI<span class="leds"><i id="ledMidi"></i><i></i></span></span>
+    <span class="port usb">USB</span>
+    <span class="port pwr">Power<span class="odot"></span></span>
+  </div>
+  <div class="header">
+    <div class="brand">
+      <div><div class="ko">K.O. II</div><div class="jp">サンプラー</div></div>
+      <div class="sub">64 MB SAMPLER COMPOSER</div>
+    </div>
+    <div class="speaker"></div>
+  </div>
+  <div class="display">
+    <div class="pictos left" id="pictosL"></div>
+    <div class="mode-leds">
+      <div class="led" id="ledRec"></div>
+      <div class="led" id="ledPlay"></div>
+      <div class="led" id="ledMet"></div>
+    </div>
+    <div class="lcd-wrap"><div class="lcd" id="lcd">KO2</div></div>
+    <div class="status-icons"><div id="stMode">MAIN</div><div id="stExtra"></div></div>
+    <div class="pictos right" id="pictosR"></div>
+  </div>
+  <div class="body">
+    <div class="top-row">
+      <div class="vol-block">
+        <div class="knob-label">Volume</div>
+        <div class="knob" id="knobVol" style="--angle:-40deg"></div>
+      </div>
+      <div class="mode-keys">
+        <button type="button" class="split-key" id="btnSound" data-btn="sound"><span class="top">SOUND</span><span class="bot">EDIT</span></button>
+        <button type="button" class="split-key main lit" id="btnMain" data-btn="main"><span class="top">MAIN</span><span class="bot">COMMIT</span></button>
+        <button type="button" class="split-key tempo" id="btnTempo" data-btn="tempo"><span class="top">TEMPO</span><span class="bot">LOOP</span></button>
+      </div>
+      <div class="knob-pair">
+        <div class="bpm-brack">BPM</div>
+        <div class="gain-brack">GAIN</div>
+        <div class="knob-unit">
+          <div class="knob orange" id="knobX" style="--angle:-60deg"></div>
+          <div class="gain-led"></div><div class="sublab">GAIN</div>
+        </div>
+        <div class="knob-unit">
+          <div class="knob-label">Metronome</div>
+          <div class="knob dark" id="knobY" style="--angle:-90deg"></div>
+          <div class="y-mark">Y</div>
+        </div>
+        <div class="swing-brack">SWING</div>
+      </div>
+    </div>
+    <div class="left-col">
+      <button type="button" class="sm-key" id="btnKeys" data-btn="keys">KEYS</button>
+      <button type="button" class="sm-key" id="btnFaderMode" data-btn="fader">FADER</button>
+      <div class="fader-track" id="faderTrack"><div class="fader-cap" id="faderCap"></div></div>
+      <button type="button" class="shift-key" id="btnShift" data-btn="shift">SHIFT</button>
+    </div>
+    <div class="groups">
+      <button type="button" class="group-btn active" data-group="0">A<span class="ico">↺</span></button>
+      <button type="button" class="group-btn" data-group="1">B<span class="ico">∅</span></button>
+      <button type="button" class="group-btn" data-group="2">C<span class="ico">⧉</span></button>
+      <button type="button" class="group-btn" data-group="3">D<span class="ico">⧉</span></button>
+    </div>
+    <div class="pads-wrap"><div id="pads"></div></div>
+    <div class="right-col">
+      <button type="button" class="split-key sample" id="btnSample" data-btn="sample"><span class="top">SAMPLE</span><span class="bot">CHOP</span></button>
+      <button type="button" class="split-key" id="btnTiming" data-btn="timing"><span class="top">TIMING</span><span class="bot">CORRECT</span></button>
+      <button type="button" class="split-key" id="btnFx" data-btn="fx"><span class="top">FX</span><span class="bot">OUTPUT</span></button>
+      <button type="button" class="split-key erase" id="btnErase" data-btn="erase"><span class="top">ERASE</span><span class="bot">SYSTEM</span></button>
+      <div class="pm-row">
+        <button type="button" class="cream-key" id="btnMinus" data-btn="minus">−</button>
+        <button type="button" class="cream-key" id="btnPlus" data-btn="plus">+</button>
+      </div>
+      <div class="transport">
+        <button type="button" class="big rec" id="btnRecord" data-btn="record">RECORD</button>
+        <button type="button" class="big play" id="btnPlay" data-btn="play">PLAY</button>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="toast" id="toast"></div>
+<div class="panel-overlay" id="layerPanel">
+  <div class="panel-card">
+    <button type="button" class="close-x" id="closeLayers">×</button>
+    <h3>Velocity layers — <span id="layerPadLabel">A:7</span></h3>
+    <p style="color:#999;font-size:11px;margin:0 0 8px">Up to 4 samples by velocity range (0–1). Empty = use pad’s main sample.</p>
+    <div id="layerRows"></div>
+    <div class="row" style="margin-top:12px">
+      <button type="button" class="primary" id="layerSave">Apply</button>
+      <button type="button" id="layerClear">Clear layers</button>
+      <label>Load sample into layer <input type="file" id="layerFile" accept="audio/*" hidden /></label>
+      <button type="button" id="layerLoadBtn">Pick audio…</button>
+    </div>
+  </div>
+</div>
+<div class="panel-overlay" id="lockPanel">
+  <div class="panel-card">
+    <button type="button" class="close-x" id="closeLock">×</button>
+    <h3>Per-step parameter locks</h3>
+    <p style="color:#999;font-size:11px">Select step with −/+, select pad, toggle Step Lock, then turn knobs / tweak params. Or edit below.</p>
+    <div class="row"><label>Step</label><input type="number" id="lockStep" min="1" max="64" value="1" style="width:60px" />
+      <label>Pad</label><select id="lockPad"></select>
+      <button type="button" id="lockToggle">Arm lock mode</button></div>
+    <div class="row"><label>Level</label><input type="range" id="lkLevel" min="0" max="1.5" step="0.01" />
+      <label>Pitch</label><input type="range" id="lkPitch" min="-24" max="24" step="0.5" /></div>
+    <div class="row"><label>LPF</label><input type="range" id="lkLpf" min="200" max="18000" step="50" />
+      <label>Atk</label><input type="range" id="lkAtk" min="0.001" max="1" step="0.001" /></div>
+    <div class="row"><button type="button" class="primary" id="lockApply">Write locks to step</button>
+      <button type="button" id="lockClear">Clear locks on step/pad</button></div>
+    <pre id="lockInfo" style="background:#111;padding:8px;font-size:11px;overflow:auto;max-height:120px"></pre>
+  </div>
+</div>
+<div class="help-overlay" id="help"><div class="help-card" id="helpCard"></div></div>
